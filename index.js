@@ -1,33 +1,29 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
+const NodeCache = require('node-cache');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const BOT_NAME = process.env.BOT_NAME || 'Asistan';
 const TRIGGER_WORD = (process.env.TRIGGER_WORD || '@asistan').toLowerCase();
 
 if (!GEMINI_API_KEY) {
-    console.error('❌ GEMINI_API_KEY eksik! Railway Variables kısmına ekle.');
+    console.error('❌ GEMINI_API_KEY eksik!');
     process.exit(1);
 }
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-
 const chatHistories = {};
+const msgRetryCounterCache = new NodeCache();
 
-const SYSTEM_PROMPT = `Sen "${BOT_NAME}" adında eğlenceli, zeki ve biraz ukala bir WhatsApp grup botusun. 
-Türkçe konuşuyorsun. Gruba dahil olmuş bir arkadaş gibi davranıyorsun.
-Kısa ve eğlenceli cevaplar veriyorsun, çok uzun yazılar yazmıyorsun.
-Bazen emoji kullanıyorsun ama abartmıyorsun.`;
+const SYSTEM_PROMPT = `Sen "${BOT_NAME}" adında eğlenceli, zeki bir WhatsApp grup botusun. Türkçe konuşuyorsun. Kısa ve eğlenceli cevaplar ver.`;
 
 async function getGeminiResponse(userId, userMessage) {
     try {
         if (!chatHistories[userId]) chatHistories[userId] = [];
-        if (chatHistories[userId].length > 40) {
-            chatHistories[userId] = chatHistories[userId].slice(-20);
-        }
+        if (chatHistories[userId].length > 40) chatHistories[userId] = chatHistories[userId].slice(-20);
 
         const chat = model.startChat({
             history: chatHistories[userId],
@@ -42,48 +38,68 @@ async function getGeminiResponse(userId, userMessage) {
             { role: 'user', parts: [{ text: userMessage }] },
             { role: 'model', parts: [{ text: response }] }
         );
-
         return response;
     } catch (error) {
-        console.error('Gemini hatası:', error);
+        console.error('Gemini hatası:', error.message);
         return '😵 Bir hata oluştu, birazdan tekrar dene!';
     }
 }
 
+let retryCount = 0;
+
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const { version } = await fetchLatestBaileysVersion();
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`Baileys v${version.join('.')}, güncel: ${isLatest}`);
 
     const sock = makeWASocket({
         version,
-        auth: state,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+        },
+        msgRetryCounterCache,
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        browser: ['Bot', 'Safari', '1.0'],
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        retryRequestDelayMs: 2000,
+        defaultQueryTimeoutMs: 60000,
+        qrTimeout: 60000,
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('\n\n📱 WHATSAPP QR KODUNU TARA:\n');
+            retryCount = 0;
+            console.log('\n\n======= QR KODU TARA =======\n');
             qrcode.generate(qr, { small: true });
-            console.log('\nWhatsApp > 3 Nokta > Bağlı Cihazlar > Cihaz Ekle\n');
+            console.log('\nWhatsApp Business > 3 Nokta > Bağlı Cihazlar > Cihaz Ekle\n');
+            console.log('============================\n');
         }
 
         if (connection === 'close') {
-            const code = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = code !== DisconnectReason.loggedOut;
-            console.log('Bağlantı kesildi, kod:', code, 'Yeniden bağlanıyor:', shouldReconnect);
-            if (shouldReconnect) {
-                setTimeout(startBot, 5000);
-            } else {
-                console.log('❌ Oturum kapandı. auth_info klasörünü sil ve yeniden başlat.');
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+            console.log(`Bağlantı kesildi. Kod: ${statusCode}`);
+
+            if (isLoggedOut) {
+                console.log('❌ Oturum sona erdi. auth_info klasörünü sil.');
+                return;
             }
+
+            retryCount++;
+            const delay = Math.min(5000 * retryCount, 30000);
+            console.log(`${delay/1000}sn sonra yeniden bağlanılıyor... (deneme ${retryCount})`);
+            setTimeout(startBot, delay);
+
         } else if (connection === 'open') {
-            console.log(`\n✅ ${BOT_NAME} bağlandı ve hazır! Grubu bekliyor...\n`);
+            retryCount = 0;
+            console.log(`\n✅ ${BOT_NAME} bağlandı! Numara: ${sock.user?.id}\n`);
         }
     });
 
@@ -95,7 +111,7 @@ async function startBot() {
             if (!msg.message) continue;
 
             const chatId = msg.key.remoteJid;
-            const isGroup = chatId.endsWith('@g.us');
+            const isGroup = chatId?.endsWith('@g.us');
 
             const messageContent =
                 msg.message?.conversation ||
@@ -118,7 +134,7 @@ async function startBot() {
                 }
                 const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
                 const botNumber = sock.user?.id?.split(':')[0];
-                if (mentionedJids.some(jid => jid.includes(botNumber))) {
+                if (botNumber && mentionedJids.some(jid => jid.includes(botNumber))) {
                     shouldRespond = true;
                     cleanMessage = messageContent.replace(/@\d+/g, '').trim();
                 }
@@ -126,20 +142,24 @@ async function startBot() {
                 shouldRespond = true;
             }
 
-            if (!shouldRespond || !cleanMessage) continue;
+            if (!shouldRespond || !cleanMessage.trim()) continue;
 
             try {
                 await sock.sendPresenceUpdate('composing', chatId);
-                const prompt = isGroup ? `[${senderName} yazdı]: ${cleanMessage}` : cleanMessage;
+                const prompt = isGroup ? `[${senderName}]: ${cleanMessage}` : cleanMessage;
                 const response = await getGeminiResponse(senderId, prompt);
-
                 await sock.sendMessage(chatId, { text: response }, { quoted: msg });
-                console.log(`✉️ [${senderName}]: ${cleanMessage.substring(0, 50)}`);
-            } catch (error) {
-                console.error('Mesaj gönderme hatası:', error);
+                console.log(`✉️ ${senderName}: ${cleanMessage.substring(0, 40)}`);
+            } catch (err) {
+                console.error('Gönderme hatası:', err.message);
             }
         }
     });
+
+    return sock;
 }
 
-startBot().catch(console.error);
+process.on('uncaughtException', (err) => console.error('Hata:', err.message));
+process.on('unhandledRejection', (err) => console.error('Promise hatası:', err?.message));
+
+startBot();
