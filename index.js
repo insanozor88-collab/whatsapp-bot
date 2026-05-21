@@ -1,165 +1,81 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const qrcode = require('qrcode-terminal');
-const pino = require('pino');
-const NodeCache = require('node-cache');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const BOT_NAME = process.env.BOT_NAME || 'Asistan';
 const TRIGGER_WORD = (process.env.TRIGGER_WORD || '@asistan').toLowerCase();
 
-if (!GEMINI_API_KEY) {
-    console.error('❌ GEMINI_API_KEY eksik!');
-    process.exit(1);
-}
-
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 const chatHistories = {};
-const msgRetryCounterCache = new NodeCache();
 
-const SYSTEM_PROMPT = `Sen "${BOT_NAME}" adında eğlenceli, zeki bir WhatsApp grup botusun. Türkçe konuşuyorsun. Kısa ve eğlenceli cevaplar ver.`;
+async function getResponse(userId, message) {
+    if (!chatHistories[userId]) chatHistories[userId] = [];
+    if (chatHistories[userId].length > 40) chatHistories[userId] = chatHistories[userId].slice(-20);
+    const chat = model.startChat({
+        history: chatHistories[userId],
+        generationConfig: { maxOutputTokens: 500, temperature: 0.9 },
+        systemInstruction: `Sen ${BOT_NAME} adında eğlenceli bir WhatsApp botusun. Türkçe konuş, kısa cevap ver.`
+    });
+    const result = await chat.sendMessage(message);
+    const response = result.response.text();
+    chatHistories[userId].push(
+        { role: 'user', parts: [{ text: message }] },
+        { role: 'model', parts: [{ text: response }] }
+    );
+    return response;
+}
 
-async function getGeminiResponse(userId, userMessage) {
-    try {
-        if (!chatHistories[userId]) chatHistories[userId] = [];
-        if (chatHistories[userId].length > 40) chatHistories[userId] = chatHistories[userId].slice(-20);
-
-        const chat = model.startChat({
-            history: chatHistories[userId],
-            generationConfig: { maxOutputTokens: 500, temperature: 0.9 },
-            systemInstruction: SYSTEM_PROMPT,
-        });
-
-        const result = await chat.sendMessage(userMessage);
-        const response = result.response.text();
-
-        chatHistories[userId].push(
-            { role: 'user', parts: [{ text: userMessage }] },
-            { role: 'model', parts: [{ text: response }] }
-        );
-        return response;
-    } catch (error) {
-        console.error('Gemini hatası:', error.message);
-        return '😵 Bir hata oluştu, birazdan tekrar dene!';
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        headless: true
     }
-}
+});
 
-let retryCount = 0;
+client.on('qr', (qr) => {
+    console.log('\n====== QR KODU TARA ======\n');
+    qrcode.generate(qr, { small: true });
+    console.log('\nWhatsApp > Bağlı Cihazlar > Cihaz Ekle\n');
+});
 
-async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`Baileys v${version.join('.')}, güncel: ${isLatest}`);
+client.on('ready', () => console.log(`✅ ${BOT_NAME} hazır!`));
 
-    const sock = makeWASocket({
-        version,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
-        },
-        msgRetryCounterCache,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: ['Bot', 'Safari', '1.0'],
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 2000,
-        defaultQueryTimeoutMs: 60000,
-        qrTimeout: 60000,
-    });
+client.on('message', async (msg) => {
+    const chat = await msg.getChat();
+    const isGroup = chat.isGroup;
+    const body = msg.body.toLowerCase();
+    const senderId = msg.from;
+    const senderName = msg._data?.notifyName || 'Arkadaş';
 
-    sock.ev.on('creds.update', saveCreds);
+    let shouldRespond = false;
+    let cleanMessage = msg.body;
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            retryCount = 0;
-            console.log('\n\n======= QR KODU TARA =======\n');
-            qrcode.generate(qr, { small: true });
-            console.log('\nWhatsApp Business > 3 Nokta > Bağlı Cihazlar > Cihaz Ekle\n');
-            console.log('============================\n');
+    if (isGroup) {
+        if (body.includes(TRIGGER_WORD)) {
+            shouldRespond = true;
+            cleanMessage = msg.body.replace(new RegExp(TRIGGER_WORD, 'gi'), '').trim();
         }
-
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-            console.log(`Bağlantı kesildi. Kod: ${statusCode}`);
-
-            if (isLoggedOut) {
-                console.log('❌ Oturum sona erdi. auth_info klasörünü sil.');
-                return;
-            }
-
-            retryCount++;
-            const delay = Math.min(5000 * retryCount, 30000);
-            console.log(`${delay/1000}sn sonra yeniden bağlanılıyor... (deneme ${retryCount})`);
-            setTimeout(startBot, delay);
-
-        } else if (connection === 'open') {
-            retryCount = 0;
-            console.log(`\n✅ ${BOT_NAME} bağlandı! Numara: ${sock.user?.id}\n`);
+        if (msg.mentionedIds?.includes(client.info.wid._serialized)) {
+            shouldRespond = true;
+            cleanMessage = msg.body.replace(/@\d+/g, '').trim();
         }
-    });
+    } else {
+        shouldRespond = true;
+    }
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
+    if (!shouldRespond || !cleanMessage.trim()) return;
 
-        for (const msg of messages) {
-            if (msg.key.fromMe) continue;
-            if (!msg.message) continue;
+    try {
+        const prompt = isGroup ? `[${senderName}]: ${cleanMessage}` : cleanMessage;
+        const response = await getResponse(senderId, prompt);
+        msg.reply(response);
+        console.log(`✉️ ${senderName}: ${cleanMessage.substring(0, 40)}`);
+    } catch (err) {
+        console.error('Hata:', err.message);
+    }
+});
 
-            const chatId = msg.key.remoteJid;
-            const isGroup = chatId?.endsWith('@g.us');
-
-            const messageContent =
-                msg.message?.conversation ||
-                msg.message?.extendedTextMessage?.text ||
-                msg.message?.imageMessage?.caption || '';
-
-            if (!messageContent) continue;
-
-            const lowerContent = messageContent.toLowerCase();
-            const senderId = msg.key.participant || msg.key.remoteJid;
-            const senderName = msg.pushName || 'Arkadaş';
-
-            let shouldRespond = false;
-            let cleanMessage = messageContent;
-
-            if (isGroup) {
-                if (lowerContent.includes(TRIGGER_WORD)) {
-                    shouldRespond = true;
-                    cleanMessage = messageContent.replace(new RegExp(TRIGGER_WORD, 'gi'), '').trim();
-                }
-                const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-                const botNumber = sock.user?.id?.split(':')[0];
-                if (botNumber && mentionedJids.some(jid => jid.includes(botNumber))) {
-                    shouldRespond = true;
-                    cleanMessage = messageContent.replace(/@\d+/g, '').trim();
-                }
-            } else {
-                shouldRespond = true;
-            }
-
-            if (!shouldRespond || !cleanMessage.trim()) continue;
-
-            try {
-                await sock.sendPresenceUpdate('composing', chatId);
-                const prompt = isGroup ? `[${senderName}]: ${cleanMessage}` : cleanMessage;
-                const response = await getGeminiResponse(senderId, prompt);
-                await sock.sendMessage(chatId, { text: response }, { quoted: msg });
-                console.log(`✉️ ${senderName}: ${cleanMessage.substring(0, 40)}`);
-            } catch (err) {
-                console.error('Gönderme hatası:', err.message);
-            }
-        }
-    });
-
-    return sock;
-}
-
-process.on('uncaughtException', (err) => console.error('Hata:', err.message));
-process.on('unhandledRejection', (err) => console.error('Promise hatası:', err?.message));
-
-startBot();
+client.initialize();
